@@ -1,0 +1,182 @@
+import asyncio
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import AsyncGenerator
+
+from google.adk.agents import BaseAgent, LlmAgent, LoopAgent
+from google.adk.agents.invocation_context import InvocationContext
+from google.adk.events import Event, EventActions
+from google.adk.runners import InMemoryRunner
+from google.genai import types
+
+MODEL = "gemini-2.0-flash"
+MAX_ITERATIONS = 3
+LINT_TIMEOUT_SECONDS = 20
+MAX_SNIPPET_CHARS = 10_000  # SRS 2.0 / 4.2
+
+
+# funct checks snippet to make sure it isn't empty and that its within bounds.
+def check_snippet(code: str) -> None:
+    """SRS 3.1 / 4.2: reject empty or oversized submissions before any API call."""
+    if not code.strip():
+        raise ValueError("No code submitted.")
+    if len(code) > MAX_SNIPPET_CHARS:
+        raise ValueError(f"Snippet is {len(code)} characters; the limit is {MAX_SNIPPET_CHARS}.")
+
+FENCE_RE = re.compile(r"^```[a-zA-Z]*\n|\n?```\s*$")
+
+
+# removes fences when gemini adds em anyways
+def strip_code_fences(text: str) -> str:
+    """LLMs love wrapping code in ``` fences; remove them before linting."""
+    return FENCE_RE.sub("", text.strip()).strip() + "\n"
+
+
+# function that runs linter, flake8, doesn't execute
+def run_flake8(code: str) -> list[str]:
+    """Lint code statically. The code is NEVER executed (security requirement, week 13)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "candidate.py"
+        path.write_text(code, encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, "-m", "flake8", "--max-line-length=100", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=LINT_TIMEOUT_SECONDS,
+        )
+    # each line looks like: /tmp/x/candidate.py:3:1: E302 expected 2 blank lines
+    return [line.split("candidate.py:", 1)[-1] for line in result.stdout.splitlines()]
+
+
+# this class calls run_flake8 which runs the linter
+class LintChecker(BaseAgent):
+    """Runs the linter on the fixer's output and decides whether the loop continues."""
+
+    # runs once to create the lintchecker agent
+    def __init__(self, name: str = "lint_checker"):
+        super().__init__(name=name, description="Lints the candidate fix; exits loop on pass.")
+
+    # decides if the code has passed the linter check or not
+    async def _run_async_impl(
+        self, ctx: InvocationContext
+    ) -> AsyncGenerator[Event, None]:
+        raw = ctx.session.state.get("fixed_code", "")
+        code = strip_code_fences(raw)
+        issues = run_flake8(code)
+        passed = not issues
+
+        attempt = ctx.session.state.get("attempt", 0) + 1
+        report = "PASS" if passed else "\n".join(issues)
+
+        yield Event(
+            author=self.name,
+            content=types.Content(
+                role="model",
+                parts=[types.Part(text=f"Attempt {attempt}: lint {'passed' if passed else 'failed'}")],
+            ),
+            actions=EventActions(
+                # saves the results to the shared state so the other agents can read them
+                # current_code = the cleaned up fix, lint_report = the linter's complaints (or PASS),
+                # lint_passed = true/false, attempt = how many tries so far
+                # gemini reads this next time around the loop, the documenter reads it at the end
+                state_delta={
+                    "current_code": code,
+                    "lint_report": report,
+                    "lint_passed": passed,
+                    "attempt": attempt,
+                },
+                # if the lint check is passed, stop the loop agent, otherwise run through the loop again
+                escalate=passed,
+            ),
+        )
+
+
+# creates the fixer agent and assigns its instructions
+# the {curly braces} in the instructions get filled in from the shared state every time it runs
+# output_key saves gemini's reply to the state as fixed_code so lintchecker can grab it
+fixer_llm = LlmAgent(
+    name="fixer_llm",
+    model=MODEL,
+    instruction="""You are a careful Python bug fixer.
+
+Original issues found by the analyst:
+{analyst_report}
+
+Current code:
+{current_code}
+
+Linter output for the current code (PASS means no lint errors):
+{lint_report}
+
+Rewrite the code so that the analyst's issues are fixed and the linter reports no errors.
+Rules:
+- Make the smallest change that fixes each issue. Do not rename public functions or change behavior that is not broken.
+- Preserve the original formatting style wherever the linter does not object.
+- Output ONLY the complete corrected Python code. No explanations, no markdown fences.""",
+    output_key="fixed_code",
+)
+
+#establishes that loop for the fixer
+# runs fixer_llm then lintchecker, max 3 times, and stops early if the lint passes
+fixer_loop = LoopAgent(
+    name="fixer_loop",
+    sub_agents=[fixer_llm, LintChecker()],
+    max_iterations=MAX_ITERATIONS,
+)
+
+
+# demo that runs the whole fixer: makes a sample buggy function, sets up the shared state,
+# runs the loop, then prints the final code (and an error message if it never passed lint)
+async def main() -> None:
+    buggy = (
+        "def average(nums):\n"
+        "    total = 0\n"
+        "    for n in nums:\n"
+        "        total += n\n"
+        "    return total / len(nums)\n"
+    )
+    check_snippet(buggy)
+    analyst_report = "average() raises ZeroDivisionError on an empty list."
+
+    runner = InMemoryRunner(agent=fixer_loop, app_name="sp202_fixer")
+    session = await runner.session_service.create_session(
+        app_name="sp202_fixer",
+        user_id="danny",
+        state={
+            # every key referenced in the instruction template must exist up front.
+            "current_code": buggy,
+            "analyst_report": analyst_report,
+            "lint_report": "PASS",
+            "attempt": 0,
+        },
+    )
+
+    async for event in runner.run_async(
+        user_id="danny",
+        session_id=session.id,
+        new_message=types.Content(role="user", parts=[types.Part(text="Fix the code.")]),
+    ):
+        if event.content and event.content.parts and event.content.parts[0].text:
+            print(f"[{event.author}] {event.content.parts[0].text[:200]}")
+
+    final = await runner.session_service.get_session(
+        app_name="sp202_fixer", user_id="danny", session_id=session.id
+    )
+    print("\n--- FINAL CODE ---\n" + final.state["current_code"])
+    passed = final.state.get("lint_passed", False)
+    print("Lint passed:", passed, "| attempts:", final.state["attempt"])
+
+    # SRS 3.8: tell the user when the max attempts ran out without a clean result.
+    if not passed:
+        print(
+            f"\nCould not fully fix the code after {MAX_ITERATIONS} attempts. "
+            f"Remaining lint issues:\n{final.state['lint_report']}"
+        )
+    # only a validated fix should continue on to the Documenter (SRS 3.6).
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
